@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import re
 import typing
 from collections.abc import Callable, Iterable
 
@@ -30,7 +31,6 @@ from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
-    _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
 from .utils import maybe_prefix
@@ -185,7 +185,6 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        self.quant_config = vllm_config.quant_config
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -245,13 +244,6 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
         ]
 
-        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
-
         expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
@@ -267,10 +259,10 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            name = self._remap_pruned_mtp_source_name(name)
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -278,12 +270,6 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
             name = self._rewrite_spec_layer_name(spec_layer, name)
-
-            if _try_load_fp8_indexer_wk(
-                name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
-            ):
-                continue
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -452,6 +438,23 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 )
 
         return loaded_params
+
+    def _remap_pruned_mtp_source_name(self, name: str) -> str:
+        layer_match = re.match(r"^(model\.layers\.)(\d+)(\..+)$", name)
+        if layer_match is None:
+            return name
+
+        layer_idx = int(layer_match.group(2))
+        target_start = self.model.mtp_start_layer_idx
+        target_end = target_start + self.model.num_mtp_layers
+
+        if target_start <= layer_idx < target_end:
+            return name
+
+        if self.model.num_mtp_layers == 1 and layer_idx >= target_end:
+            return f"{layer_match.group(1)}{target_start}{layer_match.group(3)}"
+
+        return name
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """
